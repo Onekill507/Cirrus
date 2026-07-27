@@ -206,7 +206,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/cirrus/logs"
           Xvfb :1 -screen 0 1280x800x24 -ac +extension RANDR >"$RUNNER_TEMP/cirrus/logs/xvfb.log" 2>&1 &
           # Avoid a startup race where x11vnc exits before Xvfb owns :1.
-          timeout 20 bash -c 'until xdpyinfo -display :1 >/dev/null 2>&1; do sleep 0.2; done'
+          # Do not probe with xdpyinfo: it lives in Ubuntu's separate x11-utils
+          # package. The X11 Unix socket is present as soon as Xvfb owns :1.
+          timeout 20 bash -c 'until [ -S /tmp/.X11-unix/X1 ]; do sleep 0.2; done'
           # x11vnc stays loopback-only; server.py is the only component that bridges it.
           x11vnc -display :1 -localhost -forever -shared -nopw -rfbport 5900 >"$RUNNER_TEMP/cirrus/logs/x11vnc.log" 2>&1 &
           # With no ADB_SERVER_SOCKET override, this starts the local adb daemon.
