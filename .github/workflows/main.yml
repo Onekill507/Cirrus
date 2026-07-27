@@ -1,391 +1,257 @@
-# .github/workflows/all-in-one.yml
-# ============================================================
-#  CIRRUS — Cloud Android 11, streamed to your browser, tokenless
-#  Theme: Mist (soft light)
-#  This single workflow bootstraps: KVM + Emulator + ws-scrcpy
-#  engine + custom Cirrus web UI + public tunnel (no login/token)
-# ============================================================
+# Cirrus — disposable, browser-operated Android 11+ session
+#
+# Put this file at .github/workflows/cirrus.yml in a repository, then use
+# Actions -> Cirrus Android (Mist) -> Run workflow.  The job summary contains
+# the temporary HTTPS URL.  It uses a Cloudflare *Quick Tunnel*: no account,
+# token, secret, or login is required.
+#
+# SECURITY / LIFETIME
+# - Anyone who obtains the random URL can operate this emulator. Do not sign in
+#   to sensitive accounts or put secrets in it.
+# - This is deliberately tokenless and disposable. GitHub-hosted runners and
+#   Quick Tunnels end when the job is cancelled or reaches its time limit.
+# - The workflow does not expose the runner shell or ADB over the internet;
+#   only the Android display/control bridge and clipboard API are published.
 
-name: "Cirrus - Android 11 Cloud Phone (Mist Theme)"
+name: Cirrus Android (Mist)
 
 on:
   workflow_dispatch:
     inputs:
-      session_minutes:
-        description: "How long to keep Cirrus alive (minutes, max ~330)"
-        required: false
-        default: "320"
+      api_level:
+        description: "Android API level (30 = Android 11; default 35)"
+        required: true
+        default: "35"
+        type: choice
+        options: ["30", "31", "32", "33", "34", "35"]
+      minutes:
+        description: "How long to keep it online (5–350 minutes)"
+        required: true
+        default: "120"
+        type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: cirrus-session
-  cancel-in-progress: true
-
-env:
-  AVD_NAME: cirrus_avd
-  ANDROID_API_LEVEL: 30
-  SYSTEM_IMAGE: "system-images;android-30;google_apis;x86_64"
-  WS_SCRCPY_PORT: 8000
-  CIRRUS_PORT: 9000
-
 jobs:
   cirrus:
-    name: "Boot Cirrus Cloud Android"
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
+    env:
+      API_LEVEL: ${{ inputs.api_level }}
+      REQUESTED_MINUTES: ${{ inputs.minutes }}
+      ANDROID_AVD_HOME: ${{ github.workspace }}/.cirrus-avd
+      DISPLAY: :1
+      # Do not set ADB_SERVER_SOCKET here.  On GitHub-hosted Linux runners it
+      # makes adb expect an already-running *remote* daemon and prevents adb
+      # from starting its normal local daemon on port 5037.
     steps:
-      # ---------------------------------------------------------
-      # 1. Enable KVM (hardware acceleration for the emulator)
-      # ---------------------------------------------------------
-      - name: Enable KVM group perms
+      - name: Validate requested lifetime
+        shell: bash
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
+          set -euo pipefail
+          [[ "$REQUESTED_MINUTES" =~ ^[0-9]+$ ]] || { echo "minutes must be numeric"; exit 1; }
+          (( REQUESTED_MINUTES >= 5 && REQUESTED_MINUTES <= 350 )) || { echo "minutes must be 5–350"; exit 1; }
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      # ---------------------------------------------------------
-      # 2. Android SDK: cmdline-tools + platform-tools + emulator
-      # ---------------------------------------------------------
-      - name: Install Android cmdline-tools
+      - name: Install the display, VNC, and tiny web gateway
+        shell: bash
         run: |
-          export ANDROID_SDK_ROOT=$HOME/android-sdk
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          cd "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmdline-tools.zip
-          unzip -q cmdline-tools.zip
-          mv cmdline-tools latest
-          rm cmdline-tools.zip
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/emulator" >> $GITHUB_PATH
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb x11vnc x11-xserver-utils novnc python3-aiohttp curl ca-certificates \
+            libnss3 libpulse0 libglu1-mesa mesa-utils
 
-      - name: Accept licenses & install SDK packages
+      - name: Install Android emulator image
+        shell: bash
         run: |
-          yes | sdkmanager --licenses --sdk_root="$ANDROID_SDK_ROOT" || true
-          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
-            "platform-tools" \
-            "emulator" \
-            "platforms;android-${ANDROID_API_LEVEL}" \
-            "$SYSTEM_IMAGE"
+          set -euo pipefail
+          # GitHub's Ubuntu image includes the Android command-line SDK. Find it
+          # rather than relying on a runner-image-specific ANDROID_HOME value.
+          SDKMANAGER="$(find "${ANDROID_HOME:-/opt/android-sdk}" /usr/local/lib/android/sdk -path '*/cmdline-tools/latest/bin/sdkmanager' -type f 2>/dev/null | head -n1 || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "Android command-line tools were not found on this runner image." >&2
+            exit 1
+          fi
+          export ANDROID_HOME="$(cd "$(dirname "$SDKMANAGER")/../../.." && pwd)"
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$(dirname "$SDKMANAGER"):$PATH"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platform-tools" "emulator" "platforms;android-${API_LEVEL}" \
+            "system-images;android-${API_LEVEL};google_apis;x86_64"
+          mkdir -p "$ANDROID_AVD_HOME"
+          # 'no' selects no hardware profile prompts and makes this rerunnable.
+          echo no | avdmanager create avd --force --name Cirrus \
+            --package "system-images;android-${API_LEVEL};google_apis;x86_64" \
+            --device pixel_4
 
-      # ---------------------------------------------------------
-      # 3. Create & boot the Android 11 AVD (headless, KVM)
-      # ---------------------------------------------------------
-      - name: Create Cirrus AVD (Android 11 / API 30)
+      - name: Write Cirrus Mist web application
+        shell: bash
         run: |
-          echo "no" | avdmanager create avd \
-            --name "$AVD_NAME" \
-            --package "$SYSTEM_IMAGE" \
-            --device "pixel_4" \
-            --force
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cirrus/site"
+          cat > "$RUNNER_TEMP/cirrus/server.py" <<'PY'
+          #!/usr/bin/env python3
+          """One-port Cirrus gateway: static Mist UI, RFB-over-WebSocket, clipboard."""
+          import asyncio, json, os, shlex, subprocess
+          from pathlib import Path
+          from aiohttp import web, WSMsgType
 
-          CFG="$HOME/.android/avd/${AVD_NAME}.avd/config.ini"
-          {
-            echo "hw.keyboard=yes"
-            echo "hw.gpu.enabled=yes"
-            echo "hw.gpu.mode=swiftshader_indirect"
-            echo "hw.ramSize=4096"
-            echo "disk.dataPartition.size=6G"
-            echo "hw.arc=false"
-          } >> "$CFG"
+          ROOT = Path(os.environ["CIRRUS_SITE"]).resolve()
+          NOVNC = Path("/usr/share/novnc").resolve()
+          ADB = os.environ.get("ADB", "adb")
 
-      - name: Boot Android 11 emulator (KVM accelerated, headless)
+          async def index(request):
+              return web.FileResponse(ROOT / "index.html")
+
+          async def rfb(request):
+              # noVNC talks RFB in binary WebSocket messages; this bridges those
+              # messages to x11vnc's loopback-only TCP listener. No shell/ADB is
+              # ever reachable from the public tunnel.
+              ws = web.WebSocketResponse(autoping=True, heartbeat=25, max_msg_size=0)
+              await ws.prepare(request)
+              reader, writer = await asyncio.open_connection("127.0.0.1", 5900)
+              async def tcp_to_ws():
+                  try:
+                      while data := await reader.read(65536):
+                          await ws.send_bytes(data)
+                  finally:
+                      if not ws.closed:
+                          await ws.close()
+              upstream = asyncio.create_task(tcp_to_ws())
+              try:
+                  async for msg in ws:
+                      if msg.type == WSMsgType.BINARY:
+                          writer.write(msg.data)
+                          await writer.drain()
+                      elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE, WSMsgType.CLOSED):
+                          break
+              finally:
+                  upstream.cancel()
+                  writer.close()
+                  try: await writer.wait_closed()
+                  except Exception: pass
+              return ws
+
+          def adb_clipboard_get():
+              # Android's shell ClipboardService command is present on modern API
+              # images. Return a benign empty value while the emulator is booting.
+              p = subprocess.run([ADB, "shell", "cmd", "clipboard", "get"], text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8)
+              return p.stdout.rstrip("\r\n") if p.returncode == 0 else ""
+
+          def adb_clipboard_set(value):
+              # shlex.quote makes clipboard text data, never executable shell syntax.
+              # Limit avoids accidental giant browser payloads / adb command limits.
+              value = value[:100000]
+              command = "cmd clipboard set " + shlex.quote(value)
+              subprocess.run([ADB, "shell", command], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, timeout=8, check=False)
+
+          async def clipboard(request):
+              if request.method == "GET":
+                  return web.json_response({"text": await asyncio.to_thread(adb_clipboard_get)})
+              try:
+                  data = await request.json()
+                  value = data.get("text", "")
+                  if not isinstance(value, str): raise ValueError("text must be a string")
+                  await asyncio.to_thread(adb_clipboard_set, value)
+                  return web.json_response({"ok": True})
+              except (ValueError, json.JSONDecodeError):
+                  return web.json_response({"ok": False, "error": "Invalid clipboard data"}, status=400)
+
+          app = web.Application(client_max_size=110 * 1024)
+          app.router.add_get("/", index)
+          app.router.add_get("/rfb", rfb)
+          app.router.add_get("/api/clipboard", clipboard)
+          app.router.add_post("/api/clipboard", clipboard)
+          # noVNC is an installed client library, served locally (no third-party JS CDN).
+          app.router.add_static("/novnc/", str(NOVNC), show_index=False)
+          web.run_app(app, host="127.0.0.1", port=8080, access_log=None)
+          PY
+
+          cat > "$RUNNER_TEMP/cirrus/site/index.html" <<'HTML'
+          <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Cirrus · Mist</title><style>
+          :root{color-scheme:light;--ink:#314254;--muted:#6c7c8c;--line:#d8e4ea;--glass:rgba(255,255,255,.72);--blue:#739bc3;--blue2:#527da9}
+          *{box-sizing:border-box}body{margin:0;min-height:100vh;font:14px ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);background:radial-gradient(circle at 10% 8%,#fff 0 10%,transparent 39%),radial-gradient(circle at 85% 7%,#cfe2eb 0,transparent 37%),linear-gradient(135deg,#e7eff2,#f8fbfb 48%,#d8e7ee)}
+          .shell{max-width:1500px;margin:auto;padding:22px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.brand{font-size:25px;font-weight:700;letter-spacing:.3px}.brand i{display:inline-block;width:12px;height:12px;border-radius:50%;background:#9fc5dd;box-shadow:0 0 20px #8db7d3;margin-right:8px}.mist{color:var(--muted);font-weight:500}.card{background:var(--glass);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.8);box-shadow:0 18px 45px rgba(67,95,113,.14);border-radius:20px;overflow:hidden}.bar{padding:12px 15px;border-bottom:1px solid var(--line);display:flex;gap:9px;align-items:center;flex-wrap:wrap}.dot{width:9px;height:9px;border-radius:99px;background:#9bc4ab}.status{font-size:12px;color:var(--muted);margin-right:auto}.btn{border:1px solid #cbdce5;border-radius:10px;padding:8px 11px;background:#fbfdfd;color:var(--ink);font:inherit;cursor:pointer}.btn:hover{background:#eaf4f8}.btn.primary{background:var(--blue);border-color:var(--blue);color:white}.btn.primary:hover{background:var(--blue2)}#screen{width:100%;height:calc(100vh - 160px);min-height:550px;background:#18242d}.foot{display:flex;justify-content:space-between;gap:12px;padding:10px 15px;color:var(--muted);font-size:12px}.warn{color:#806c41}@media(max-width:600px){.shell{padding:10px}.top{margin:4px 3px 10px}.brand{font-size:21px}#screen{height:calc(100vh - 195px);min-height:420px}.foot{display:block}.foot span{display:block;margin:3px 0}}</style></head>
+          <body><main class="shell"><header class="top"><div class="brand"><i></i>Cirrus <span class="mist">/ Mist</span></div><div class="mist">Android remote workspace</div></header><section class="card"><div class="bar"><span class="dot"></span><span id="state" class="status">Connecting to Android…</span><button class="btn" id="copyPhone">Phone → PC</button><button class="btn primary" id="pastePhone">PC → Phone</button><button class="btn" id="fullscreen">Full screen</button></div><div id="screen"></div><footer class="foot"><span>Click the phone screen, then type with your PC keyboard. Use the clipboard buttons for reliable two-way paste.</span><span class="warn">Temporary public session · do not use sensitive accounts</span></footer></section></main>
+          <script type="module">
+          import RFB from '/novnc/core/rfb.js';
+          const state=document.querySelector('#state'), screen=document.querySelector('#screen');
+          const rfb=new RFB(screen, `${location.protocol==='https:'?'wss':'ws'}://${location.host}/rfb`);
+          rfb.scaleViewport=true; rfb.resizeSession=false; rfb.showDot=true; rfb.viewOnly=false;
+          rfb.addEventListener('connect',()=>state.textContent='Connected · click screen to control');
+          rfb.addEventListener('disconnect',e=>state.textContent=e.detail.clean?'Disconnected':'Connection lost — refresh to retry');
+          async function api(method, body){const r=await fetch('/api/clipboard',{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error('Clipboard service unavailable');return r.json()}
+          const notice=t=>{state.textContent=t;setTimeout(()=>{if(rfb._rfb_connection_state==='connected')state.textContent='Connected · click screen to control'},2600)};
+          document.querySelector('#pastePhone').onclick=async()=>{try{await api('POST',{text:await navigator.clipboard.readText()});notice('PC clipboard sent to phone');}catch(e){notice('Allow clipboard permission, then try again')}};
+          document.querySelector('#copyPhone').onclick=async()=>{try{const x=await api('GET');await navigator.clipboard.writeText(x.text||'');notice('Phone clipboard copied to PC');}catch(e){notice('Allow clipboard permission, then try again')}};
+          document.querySelector('#fullscreen').onclick=()=>screen.requestFullscreen?.();
+          // A normal browser paste event is also forwarded immediately to Android.
+          window.addEventListener('paste',async e=>{const t=e.clipboardData?.getData('text/plain');if(t!==undefined){try{await api('POST',{text:t});notice('PC clipboard sent to phone')}catch{}}});
+          </script></body></html>
+          HTML
+
+      - name: Boot Android and publish the local Mist gateway
+        shell: bash
         run: |
-          nohup emulator -avd "$AVD_NAME" \
-            -no-window -no-audio -no-boot-anim \
-            -gpu swiftshader_indirect -accel on \
-            -camera-back none -camera-front none \
-            -qemu -enable-kvm > "$HOME/emulator.log" 2>&1 &
-
+          set -euo pipefail
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p "$RUNNER_TEMP/cirrus/logs"
+          Xvfb :1 -screen 0 1280x800x24 -ac +extension RANDR >"$RUNNER_TEMP/cirrus/logs/xvfb.log" 2>&1 &
+          # Avoid a startup race where x11vnc exits before Xvfb owns :1.
+          timeout 20 bash -c 'until xdpyinfo -display :1 >/dev/null 2>&1; do sleep 0.2; done'
+          # x11vnc stays loopback-only; server.py is the only component that bridges it.
+          x11vnc -display :1 -localhost -forever -shared -nopw -rfbport 5900 >"$RUNNER_TEMP/cirrus/logs/x11vnc.log" 2>&1 &
+          # With no ADB_SERVER_SOCKET override, this starts the local adb daemon.
           adb start-server
+          emulator -avd Cirrus -no-snapshot -wipe-data -no-boot-anim -noaudio \
+            -gpu swiftshader_indirect -no-metrics >"$RUNNER_TEMP/cirrus/logs/emulator.log" 2>&1 &
           adb wait-for-device
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = 1 ]; do sleep 2; done'
+          adb shell settings put secure show_ime_with_hard_keyboard 1 || true
+          adb shell input keyevent 82 || true
+          CIRRUS_SITE="$RUNNER_TEMP/cirrus/site" python3 "$RUNNER_TEMP/cirrus/server.py" >"$RUNNER_TEMP/cirrus/logs/cirrus.log" 2>&1 &
+          # Tokenless Cloudflare Quick Tunnel. Its unguessable URL is intentionally
+          # printed only to this workflow's logs and step summary.
+          curl -fsSL -o /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 >"$RUNNER_TEMP/cirrus/logs/tunnel.log" 2>&1 &
+          for n in $(seq 1 45); do
+            URL="$(grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' "$RUNNER_TEMP/cirrus/logs/tunnel.log" | head -n1 || true)"
+            [[ -n "$URL" ]] && break
+            sleep 2
+          done
+          [[ -n "${URL:-}" ]] || { cat "$RUNNER_TEMP/cirrus/logs/tunnel.log"; exit 1; }
+          echo "CIRRUS_URL=$URL" >> "$GITHUB_ENV"
+          { echo "# ☁️ Cirrus is ready"; echo; echo "## [$URL]($URL)"; echo; echo "Android API ${API_LEVEL}. This is a **tokenless, temporary public URL**; anyone with it can control this disposable phone."; } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Cirrus ready::$URL"
 
-          echo "Waiting for Android to finish booting..."
-          boot_completed=""
-          tries=0
-          until [ "$boot_completed" = "1" ] || [ $tries -ge 90 ]; do
-            boot_completed=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-            tries=$((tries + 1))
-            sleep 5
+      - name: Keep Cirrus online
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Cirrus is live at: $CIRRUS_URL"
+          echo "It will stop after ${REQUESTED_MINUTES} minutes, or immediately if this workflow is cancelled."
+          end=$(( $(date +%s) + REQUESTED_MINUTES * 60 ))
+          while (( $(date +%s) < end )); do
+            # Fail visibly instead of leaving a stale public URL if a critical service dies.
+            pgrep -f 'emulator.*-avd Cirrus' >/dev/null || { echo "Emulator exited"; exit 1; }
+            pgrep -f 'cloudflared tunnel' >/dev/null || { echo "Tunnel exited"; exit 1; }
+            sleep 20
           done
 
-          if [ "$boot_completed" != "1" ]; then
-            echo "Emulator failed to boot in time."
-            cat "$HOME/emulator.log"
-            exit 1
-          fi
-
-          adb shell input keyevent 82
-          adb shell settings put global window_animation_scale 0
-          adb shell settings put global transition_animation_scale 0
-          adb shell settings put global animator_duration_scale 0
-          echo "✅ Android 11 booted and unlocked."
-
-      # ---------------------------------------------------------
-      # 4. Build the streaming/input/clipboard engine (ws-scrcpy)
-      # ---------------------------------------------------------
-      - name: Clone & build ws-scrcpy engine
-        run: |
-          git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git "$HOME/ws-scrcpy"
-          cd "$HOME/ws-scrcpy"
-          npm ci
-          npm run dist
-
-      - name: Launch ws-scrcpy engine (internal, localhost only)
-        run: |
-          cd "$HOME/ws-scrcpy"
-          cat > config.yaml << 'EOF'
-          server:
-            port: 8000
-            hostname: 127.0.0.1
-          EOF
-          nohup node dist/index.js > "$HOME/ws-scrcpy.log" 2>&1 &
-          sleep 8
-          cat "$HOME/ws-scrcpy.log" || true
-
-      # ---------------------------------------------------------
-      # 5. Build "Cirrus" — our own web front-end, Mist theme
-      # ---------------------------------------------------------
-      - name: Build Cirrus Web (Mist theme, custom UI)
-        run: |
-          mkdir -p "$HOME/cirrus-web/public"
-          cd "$HOME/cirrus-web"
-          npm init -y > /dev/null
-          npm install express http-proxy-middleware > /dev/null
-
-          cat > server.js << 'EOF'
-          const express = require('express');
-          const path = require('path');
-          const { createProxyMiddleware } = require('http-proxy-middleware');
-
-          const app = express();
-          const PORT = process.env.CIRRUS_PORT || 9000;
-          const TARGET = 'http://127.0.0.1:8000';
-
-          app.use('/stream', createProxyMiddleware({
-            target: TARGET,
-            changeOrigin: true,
-            ws: true,
-            pathRewrite: { '^/stream': '' },
-          }));
-
-          app.use(express.static(path.join(__dirname, 'public')));
-
-          app.listen(PORT, '0.0.0.0', () => {
-            console.log('Cirrus web listening on port ' + PORT);
-          });
-          EOF
-
-          cat > public/style.css << 'EOF'
-          :root{
-            --mist-bg:#f4f7fb;
-            --mist-panel:#ffffff;
-            --mist-accent:#aed0f0;
-            --mist-accent-dark:#6fa8d8;
-            --mist-text:#33414f;
-            --mist-border:#dce7f3;
-            --radius:14px;
-          }
-          *{ box-sizing:border-box; }
-          body{
-            margin:0;
-            font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
-            background:linear-gradient(180deg,var(--mist-bg),#eaf1f9);
-            color:var(--mist-text);
-            height:100vh;
-            display:flex;
-            flex-direction:column;
-          }
-          header{
-            background:var(--mist-panel);
-            padding:14px 22px;
-            display:flex;
-            align-items:center;
-            justify-content:space-between;
-            box-shadow:0 2px 8px rgba(50,80,110,0.08);
-            border-bottom:1px solid var(--mist-border);
-          }
-          header h1{ font-size:20px; margin:0; font-weight:600; }
-          header h1 span{ color:var(--mist-accent-dark); }
-          .toolbar button{
-            background:var(--mist-accent);
-            border:none;
-            color:#1f2d3a;
-            padding:8px 16px;
-            margin-left:8px;
-            border-radius:var(--radius);
-            cursor:pointer;
-            font-weight:500;
-            transition:0.2s;
-          }
-          .toolbar button:hover{ background:var(--mist-accent-dark); color:#fff; }
-          main{
-            flex:1;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            padding:20px;
-          }
-          #cirrus-frame{
-            width:420px;
-            height:calc(100vh - 130px);
-            max-height:900px;
-            border:none;
-            border-radius:24px;
-            background:#000;
-            box-shadow:0 10px 30px rgba(50,80,110,0.18);
-          }
-          footer{ text-align:center; font-size:12px; color:#7d8fa1; padding:8px; }
-          EOF
-
-          cat > public/index.html << 'EOF'
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-            <meta charset="UTF-8">
-            <title>Cirrus — Your Cloud Android</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <link rel="stylesheet" href="style.css">
-          </head>
-          <body>
-            <header>
-              <h1>☁️ <span>Cirrus</span> — Mist</h1>
-              <div class="toolbar">
-                <button id="btn-paste">📋 Paste PC → Phone</button>
-                <button id="btn-copy">📥 Copy Phone → PC</button>
-                <button id="btn-fullscreen">⛶ Fullscreen</button>
-              </div>
-            </header>
-            <main>
-              <iframe id="cirrus-frame" src="/stream" allow="clipboard-read; clipboard-write"></iframe>
-            </main>
-            <footer>Cirrus • Android 11 • Mist Theme • Tokenless Session</footer>
-            <script src="app.js"></script>
-          </body>
-          </html>
-          EOF
-
-          cat > public/app.js << 'EOF'
-          const frame = document.getElementById('cirrus-frame');
-
-          document.getElementById('btn-fullscreen').onclick = () => {
-            if (frame.requestFullscreen) frame.requestFullscreen();
-          };
-
-          // PC -> Phone: read PC clipboard, forward into the embedded
-          // ws-scrcpy stream, which relays it over the scrcpy control
-          // socket to the Android clipboard (auto-synced on device).
-          document.getElementById('btn-paste').onclick = async () => {
-            try {
-              const text = await navigator.clipboard.readText();
-              frame.contentWindow.postMessage({ type: 'cirrus-set-clipboard', text }, '*');
-              alert('Sent PC clipboard to Cirrus (phone).');
-            } catch (e) {
-              alert('Clipboard permission denied by browser: ' + e.message);
-            }
-          };
-
-          // Phone -> PC: pull the last clipboard value tracked by the
-          // scrcpy control connection (auto-updated whenever the
-          // device copies text).
-          document.getElementById('btn-copy').onclick = () => {
-            frame.contentWindow.postMessage({ type: 'cirrus-get-clipboard' }, '*');
-          };
-
-          window.addEventListener('message', async (ev) => {
-            if (ev.data && ev.data.type === 'cirrus-clipboard-data') {
-              try {
-                await navigator.clipboard.writeText(ev.data.text || '');
-                alert('Phone clipboard copied to PC clipboard!');
-              } catch (e) {
-                console.warn('Could not write to PC clipboard:', e);
-              }
-            }
-          });
-          EOF
-
-          nohup node server.js > "$HOME/cirrus-web.log" 2>&1 &
-          sleep 3
-          cat "$HOME/cirrus-web.log" || true
-
-      # ---------------------------------------------------------
-      # 6. Expose Cirrus publicly — tokenless (Cloudflare Quick Tunnel)
-      # ---------------------------------------------------------
-      - name: Install cloudflared
-        run: |
-          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/cloudflared
-
-      - name: Open tokenless public tunnel to Cirrus
-        run: |
-          nohup cloudflared tunnel --url http://localhost:$CIRRUS_PORT --no-autoupdate > "$HOME/cloudflared.log" 2>&1 &
-
-          echo "Waiting for public URL..."
-          URL=""
-          for i in $(seq 1 40); do
-            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$HOME/cloudflared.log" | head -n1)
-            [ -n "$URL" ] && break
-            sleep 3
-          done
-
-          if [ -z "$URL" ]; then
-            echo "Failed to obtain tunnel URL"
-            cat "$HOME/cloudflared.log"
-            exit 1
-          fi
-
-          echo "CIRRUS_URL=$URL" >> $GITHUB_ENV
-          {
-            echo "## ☁️ Cirrus is LIVE"
-            echo ""
-            echo "**Open on any PC/phone browser — no login, no token:**"
-            echo ""
-            echo "### 🔗 $URL"
-            echo ""
-            echo "- Theme: Mist (soft light)"
-            echo "- Android: 11 (API 30)"
-            echo "- Session length: ${{ github.event.inputs.session_minutes }} minutes"
-          } >> $GITHUB_STEP_SUMMARY
-          echo "Cirrus URL => $URL"
-
-      # ---------------------------------------------------------
-      # 7. Keep the session alive for the requested duration
-      # ---------------------------------------------------------
-      - name: Keep Cirrus session alive
-        run: |
-          MINUTES="${{ github.event.inputs.session_minutes }}"
-          [ -z "$MINUTES" ] && MINUTES=320
-          TOTAL=$((MINUTES * 60))
-          ELAPSED=0
-          echo "Cirrus running at: $CIRRUS_URL"
-          while [ $ELAPSED -lt $TOTAL ]; do
-            sleep 60
-            ELAPSED=$((ELAPSED + 60))
-            if ! pgrep -f "emulator .*-avd $AVD_NAME" > /dev/null; then
-              echo "Emulator process died, stopping session."
-              break
-            fi
-            echo "[$((ELAPSED / 60))/$MINUTES min] Cirrus alive at $CIRRUS_URL"
-          done
-
-      - name: Session ended
-        if: always()
-        run: echo "Cirrus session closed. Re-run the workflow (Actions tab) to get a fresh instance + new URL."
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-diagnostics
+          path: ${{ runner.temp }}/cirrus/logs
+          if-no-files-found: ignore
+          retention-days: 1
